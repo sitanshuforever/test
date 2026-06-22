@@ -1,0 +1,70 @@
+#
+# privesc-enum.cna - Local privilege escalation opportunity checks
+#
+# Registers the `enum-privesc` Beacon alias. Looks for common misconfigs:
+# unquoted service paths, writable service binaries, always-install-elevated,
+# scheduled task owners, AlwaysInstallElevated, and UAC level.
+#
+# FOR USE ON AUTHORIZED RED TEAM ENGAGEMENTS ONLY.
+#
+
+sub enum_privesc {
+    local('$bid @cmds');
+    $bid = $1;
+
+    enum_log($bid, "privesc check starting");
+
+    @cmds = @(
+        # Token and group context
+        "whoami /priv",
+        "whoami /groups",
+
+        # UAC configuration
+        "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v EnableLUA",
+        "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v ConsentPromptBehaviorAdmin",
+
+        # AlwaysInstallElevated (MSI privesc)
+        "reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated",
+        "reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated",
+
+        # Service binary paths (unquoted paths with spaces are exploitable)
+        "wmic service get name,pathname,startmode,startname | findstr /i \"auto\" | findstr /i /v \"c:\\windows\\\"",
+
+        # Writable service directories
+        "sc query state= all",
+
+        # Scheduled tasks - look for tasks running as SYSTEM with user-writable binaries
+        "schtasks /query /fo LIST /v",
+
+        # Modifiable registry autoruns
+        "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "reg query HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+
+        # Stored credentials
+        "cmdkey /list",
+        "dir /a %APPDATA%\\Microsoft\\Credentials",
+        "dir /a %LOCALAPPDATA%\\Microsoft\\Credentials"
+    );
+
+    enum_run_each($bid, @cmds);
+    enum_log($bid, "privesc check queued");
+}
+
+alias enum-privesc {
+    enum_privesc($1);
+}
+
+beacon_command_register(
+    "enum-privesc",
+    "Local privilege escalation opportunity checks",
+    "Synopsis: enum-privesc\n\n" .
+    "Checks for common local privesc paths:\n" .
+    "  whoami /priv             - current token privileges (SeImpersonate etc.)\n" .
+    "  UAC reg keys             - UAC enforcement level\n" .
+    "  AlwaysInstallElevated    - MSI install privesc (HKCU + HKLM)\n" .
+    "  WMIC service paths       - unquoted service paths with spaces\n" .
+    "  schtasks /query          - scheduled tasks (SYSTEM-owned with weak ACLs)\n" .
+    "  Autorun reg keys         - HKLM/HKCU run keys\n" .
+    "  cmdkey / Credentials dir - cached credentials on disk\n\n" .
+    "No binaries are dropped. Runs via cmd.exe through the current Beacon."
+);

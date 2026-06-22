@@ -1,0 +1,75 @@
+#
+# redteam-enum.cna - Master loader for the enumeration toolkit
+#
+# Cobalt Strike Aggressor Script. Load this single file from
+# Cobalt Strike -> Script Manager -> Load. It pulls in every
+# enumeration module and wires up the "Enum" beacon right-click menu.
+#
+# FOR USE ON AUTHORIZED RED TEAM ENGAGEMENTS ONLY.
+#
+
+# Pull in each module relative to this loader's location so it works
+# no matter what the operator's working directory is.
+include(script_resource("modules/host-enum.cna"));
+include(script_resource("modules/domain-enum.cna"));
+include(script_resource("modules/network-enum.cna"));
+include(script_resource("modules/privesc-enum.cna"));
+
+# ---------------------------------------------------------------------------
+# Shared helpers used across modules
+# ---------------------------------------------------------------------------
+
+# enum_log(bid, message) - consistent operator-facing logging into the
+# Beacon console so output is easy to scrape from the activity report.
+sub enum_log {
+    local('$bid $msg');
+    ($bid, $msg) = @_;
+    blog($bid, "[enum] $msg");
+}
+
+# enum_run_each(bid, @commands) - run a list of cmd.exe one-liners back to
+# back through a single Beacon, tagging each with a header for readability.
+sub enum_run_each {
+    local('$bid @cmds $cmd');
+    ($bid, $cmds) = @_;
+    foreach $cmd (@cmds) {
+        blog($bid, "[enum] > $cmd");
+        bshell($bid, $cmd);
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Right-click "Enum" menu on Beacon sessions
+# ---------------------------------------------------------------------------
+popup beacon_bottom {
+    menu "&Enum" {
+        item "Host" {
+            local('$bid');
+            foreach $bid (@_) { enum_host($bid); }
+        }
+        item "Domain" {
+            local('$bid');
+            foreach $bid (@_) { enum_domain($bid); }
+        }
+        item "Network" {
+            local('$bid');
+            foreach $bid (@_) { enum_network($bid); }
+        }
+        item "Local Privesc Checks" {
+            local('$bid');
+            foreach $bid (@_) { enum_privesc($bid); }
+        }
+        separator();
+        item "Run ALL Modules" {
+            local('$bid');
+            foreach $bid (@_) {
+                enum_host($bid);
+                enum_domain($bid);
+                enum_network($bid);
+                enum_privesc($bid);
+            }
+        }
+    }
+}
+
+println("[redteam-enum] toolkit loaded. Type 'help enum-host' in a Beacon for usage.");
