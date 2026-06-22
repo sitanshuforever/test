@@ -1,0 +1,161 @@
+# ad_enum.cna — Active Directory enumeration
+# Uses net.exe, nltest, dsquery, LDAP via PowerShell
+# All commands run in-context of the beacon's token
+
+alias domain-info {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Collecting domain basic info");
+    bshell($bid, "net config workstation");
+    bshell($bid, "nltest /dclist:");
+    bshell($bid, "nltest /domain_trusts /all_trusts");
+    bshell($bid, "ipconfig /all | findstr /i \"DNS Suffix\"");
+    bshell($bid, "wmic computersystem get Domain,DomainRole,PartOfDomain /format:list");
+}
+
+alias dc-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating domain controllers");
+    bshell($bid, "nltest /dclist:");
+    bshell($bid, "net group \"Domain Controllers\" /domain");
+    bpowershell($bid, "[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain() | Select-Object -ExpandProperty DomainControllers | Select-Object Name,IPAddress,OSVersion,Roles | Format-Table -AutoSize");
+}
+
+alias domain-users {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating domain users");
+    bshell($bid, "net user /domain");
+    bpowershell($bid, "Get-ADUser -Filter * -Properties DisplayName,SamAccountName,Enabled,LastLogonDate,PasswordLastSet,MemberOf | Select-Object SamAccountName,DisplayName,Enabled,LastLogonDate,PasswordLastSet | Format-Table -AutoSize");
+}
+
+alias domain-groups {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating domain groups");
+    bshell($bid, "net group /domain");
+    bpowershell($bid, "Get-ADGroup -Filter * | Select-Object Name,GroupCategory,GroupScope,DistinguishedName | Sort-Object Name | Format-Table -AutoSize");
+}
+
+alias da-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating privileged domain groups");
+    bshell($bid, "net group \"Domain Admins\" /domain");
+    bshell($bid, "net group \"Enterprise Admins\" /domain");
+    bshell($bid, "net group \"Schema Admins\" /domain");
+    bshell($bid, "net group \"Group Policy Creator Owners\" /domain");
+    bshell($bid, "net localgroup Administrators");
+    bpowershell($bid, "Get-ADGroupMember -Identity 'Domain Admins' -Recursive | Select-Object SamAccountName,Name,objectClass | Format-Table -AutoSize");
+}
+
+alias spn-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating SPNs (Kerberoastable accounts)");
+    bpowershell($bid, "Get-ADUser -Filter {ServicePrincipalName -ne '$null'} -Properties ServicePrincipalName,SamAccountName,Enabled | Select-Object SamAccountName,Enabled,ServicePrincipalName | Format-Table -AutoSize");
+    bshell($bid, "setspn -Q */*");
+}
+
+alias asrep-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating AS-REP roastable accounts");
+    bpowershell($bid, "Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true} -Properties SamAccountName,DoesNotRequirePreAuth | Select-Object SamAccountName,DoesNotRequirePreAuth | Format-Table -AutoSize");
+}
+
+alias gpo-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating Group Policy Objects");
+    bpowershell($bid, "Get-GPO -All | Select-Object DisplayName,GpoStatus,CreationTime,ModificationTime | Format-Table -AutoSize");
+    bshell($bid, "gpresult /r");
+}
+
+alias trust-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating domain trusts");
+    bshell($bid, "nltest /domain_trusts /all_trusts /v");
+    bpowershell($bid, "([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).GetAllTrustRelationships() | Format-Table -AutoSize");
+}
+
+alias ou-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating Organizational Units");
+    bpowershell($bid, "Get-ADOrganizationalUnit -Filter * | Select-Object Name,DistinguishedName | Sort-Object DistinguishedName | Format-Table -AutoSize");
+}
+
+alias acl-enum {
+    local('$bid $target');
+    $bid    = $1;
+    $target = $2 ? $2 : "Domain Admins";
+    blog($bid, "\c9[*] Checking ACLs on: $target");
+    bpowershell($bid, "(Get-ACL -Path (\"AD:\\\" + (Get-ADGroup '$target').DistinguishedName)).Access | Select-Object IdentityReference,ActiveDirectoryRights,AccessControlType | Format-Table -AutoSize");
+}
+
+alias computers-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating domain computers");
+    bshell($bid, "net view /domain");
+    bpowershell($bid, "Get-ADComputer -Filter * -Properties Name,OperatingSystem,OperatingSystemVersion,IPv4Address,LastLogonDate | Select-Object Name,OperatingSystem,OperatingSystemVersion,IPv4Address,LastLogonDate | Format-Table -AutoSize");
+}
+
+alias unconstrained-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating accounts with unconstrained delegation");
+    bpowershell($bid, "Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties Name,DistinguishedName | Format-Table -AutoSize");
+    bpowershell($bid, "Get-ADUser -Filter {TrustedForDelegation -eq $true} -Properties SamAccountName,DistinguishedName | Format-Table -AutoSize");
+}
+
+alias constrained-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating accounts with constrained delegation");
+    bpowershell($bid, "Get-ADObject -Filter {msDS-AllowedToDelegateTo -ne '$null'} -Properties msDS-AllowedToDelegateTo,SamAccountName | Format-Table -AutoSize");
+}
+
+alias ad-enum-all {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c2[*] === Running full AD enumeration ===");
+    domain-info($bid);
+    dc-enum($bid);
+    domain-users($bid);
+    domain-groups($bid);
+    da-enum($bid);
+    spn-enum($bid);
+    asrep-enum($bid);
+    gpo-enum($bid);
+    trust-enum($bid);
+    ou-enum($bid);
+    computers-enum($bid);
+    unconstrained-enum($bid);
+    constrained-enum($bid);
+}
+
+# ─── right-click menu ───────────────────────────────────────────────────────
+
+popup beacon_bottom {
+    menu "Enum: Active Directory" {
+        item "Domain Info"                { domain-info(selectedBeacons()); }
+        item "Domain Controllers"         { dc-enum(selectedBeacons()); }
+        item "Domain Users"               { domain-users(selectedBeacons()); }
+        item "Domain Groups"              { domain-groups(selectedBeacons()); }
+        item "Privileged Groups (DA/EA)"  { da-enum(selectedBeacons()); }
+        item "SPNs (Kerberoastable)"      { spn-enum(selectedBeacons()); }
+        item "AS-REP Roastable Accounts"  { asrep-enum(selectedBeacons()); }
+        item "GPOs"                       { gpo-enum(selectedBeacons()); }
+        item "Domain Trusts"              { trust-enum(selectedBeacons()); }
+        item "Organizational Units"       { ou-enum(selectedBeacons()); }
+        item "Domain Computers"           { computers-enum(selectedBeacons()); }
+        item "Unconstrained Delegation"   { unconstrained-enum(selectedBeacons()); }
+        item "Constrained Delegation"     { constrained-enum(selectedBeacons()); }
+        separator;
+        item "\[Run All\] AD Enum"        { ad-enum-all(selectedBeacons()); }
+    }
+}

